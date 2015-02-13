@@ -1,0 +1,256 @@
+#cloud-config
+hostname: elasticsearch
+coreos:
+  update:
+    group: stable
+    reboot-strategy: off
+
+  etcd:
+    # generate a new token for each unique cluster from http://discovery.etcd.io/new
+    # WARNING: replace each time you 'vagrant destroy'
+    discovery: https://discovery.etcd.io/<token>
+    addr: $private_ipv4:4001
+    peer-addr: $private_ipv4:7001
+    name: elasticsearch
+
+  fleet:
+    public-ip: $private_ipv4
+    metadata: name=%H
+
+  units:
+
+# Firewall service
+    - name: firewall.service
+      command: start
+      content: |
+        [Unit]
+        Description=Packet Filtering Framework
+        DefaultDependencies=no
+        After=systemd-sysctl.service
+        Before=sysinit.target
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/sbin/iptables-restore /etc/iptables.rules
+        ExecReload=/usr/sbin/iptables-restore /etc/iptables.rules
+        ExecStop=/usr/sbin/iptables -P INPUT ACCEPT ; /usr/sbin/iptables --flush
+        RemainAfterExit=yes
+
+# Elasticsearch
+    - name: elasticsearch.service
+      command: start
+      content: |
+        [Unit]
+        Description=Elasticsearch Server
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        TimeoutStartSec=0
+        Type=oneshot
+        RemainAfterExit=true
+        ExecStartPre=-/usr/bin/docker kill elasticsearch
+        ExecStartPre=-/usr/bin/docker rm -f elasticsearch
+        ExecStartPre=/usr/bin/docker pull million12/elasticsearch
+        ExecStart=/usr/bin/docker run \
+          -d \
+          --name elasticsearch \
+          --expose=[9200] \
+          --env="KIBANA_PORT=80" \
+          --env="KIBANA_DASHBOARD=default" \
+          -v /etc/elasticsearch/elasticsearch.yml:/opt/elasticsearch/config/elasticsearch.yml \
+          -v /elasticsearch:/opt/elasticsearch/data \
+          million12/elasticsearch
+        ExecStop=/usr/bin/docker stop elasticsearch
+        Restart=allways
+
+        [Install]
+        WantedBy=multi-user.target
+
+# Logstash
+    - name: logstash.service
+      command: start
+      content: |
+        [Unit]
+        Description=Logstash Server
+        After=elasticsearch.service
+        Requires=elasticsearch.service
+        PartOf=elasticsearch.service
+
+        [Service]
+        TimeoutStartSec=0
+        Type=oneshot
+        RemainAfterExit=true
+        EnvironmentFile=/etc/environment
+        # Get Elasticsearch docker IP
+        ExecStartPre=-/usr/bin/bash -c "/etc/environment.sh"
+        ExecStartPre=-/usr/bin/docker kill logstash
+        ExecStartPre=-/usr/bin/docker rm -f logstash
+        ExecStartPre=/usr/bin/docker pull million12/logstash:latest
+        ExecStart=/usr/bin/docker run \
+          -d \
+          --name logstash \
+          -p 5000:5000 \
+          -v /etc/logstash:/etc/logstash \
+          million12/logstash
+        ExecStop=/usr/bin/docker stop logstash
+        Restart=allways
+
+        [Install]
+        WantedBy=multi-user.target
+
+# Nginx
+    - name: nginx.service
+      command: start
+      content: |
+        [Unit]
+        Description=Nginx
+        After=elasticsearch.service
+        Requires=docker.service
+        PartOf=elasticsearch.service
+
+        [Service]
+        Restart=on-failure
+        RestartSec=20
+        TimeoutStartSec=0
+        EnvironmentFile=/etc/environment
+        # Get Elasticsearch docker IP
+        ExecStartPre=-/usr/bin/bash -c "/etc/environment.sh"
+        ExecStartPre=-/usr/bin/docker kill nginx
+        ExecStartPre=-/usr/bin/docker rm -f nginx
+        ExecStartPre=-/usr/bin/docker pull million12/nginx
+        ExecStart=-/usr/bin/docker run \
+          --name=nginx \
+          -p 80:80 \
+          -v /etc/nginx/hosts.d:/etc/nginx/hosts.d \
+          million12/nginx
+        ExecStop=/usr/bin/docker stop nginx
+
+        [Install]
+        WantedBy=multi-user.target
+
+users:
+  - name: user
+    primary-group: wheel
+    groups: [ sudo, docker ]
+    ssh-authorized-keys:
+      - ssh-rsa your-key-here
+write_files:
+# Firewall rules
+  - path: /etc/iptables.rules
+    content: |
+      *filter
+      :INPUT DROP
+      -A INPUT -i lo -j ACCEPT -m comment --comment "All traffic from localhost"
+      -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT -m comment --comment "Accept all already established connections"
+      -A INPUT -p icmp -m icmp --icmp-type 8 -m state --state NEW,RELATED,ESTABLISHED -j ACCEPT -m comment --comment "ping pong stuff"
+      -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT -m comment --comment "SSH access"
+      -A INPUT -p tcp -m tcp --dport 80 -j ACCEPT -m comment --comment "HTTP"
+      COMMIT
+
+# SSHD Mods
+  - path: /etc/ssh/sshd_config
+    content: |
+      UsePrivilegeSeparation sandbox
+      Subsystem sftp internal-sftp
+      PasswordAuthentication no
+      ChallengeResponseAuthentication no
+      PermitRootLogin no
+
+# Environment Variables
+  - path: /etc/environment
+    content: |
+      COREOS_PUBLIC_IPV4=$public_ipv4
+      COREOS_PRIVATE_IPV4=$private_ipv4
+      ELASTICSEARCH_IP=127.0.0.1
+
+# Linode Private network tweak
+  - path: /etc/systemd/network/50-static.network
+    content: |
+      [Match]
+      Name=eth0
+
+      [Network]
+      Address=$public_ipv4/24
+      Address=$private_ipv4/17
+      Gateway=$gateway.1
+      DNS=8.8.8.8
+
+# Logstash Config
+  - path: /etc/logstash/logstash.conf
+    content: |
+      input {
+        lumberjack {
+            port => 5000
+            type => "logs"
+            ssl_certificate => "/etc/logstash/ssl/logstash-forwarder.crt"
+            ssl_key => "/etc/logstash/ssl/logstash-forwarder.key"
+          }
+      }
+      filter {
+        if [type] == "syslog" {
+          grok {
+            match => { "message" => "%{SYSLOGTIMESTAMP:syslog_timestamp} %{SYSLOGHOST:syslog_hostname} %{DATA:syslog_program}(?:\[%{POSINT:syslog_pid}\])?: %{GREEDYDATA:syslog_message}" }
+            add_field => [ "received_at", "%{@timestamp}" ]
+            add_field => [ "received_from", "%{host}" ]
+          }
+          syslog_pri { }
+          date {
+            match => [ "syslog_timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
+          }
+        }
+      }
+      output {
+        elasticsearch {
+          protocol => "http"
+          host => "127.0.0.1"
+          port => 9200
+        }
+      }
+
+# Elasticsearch Environmental Variable updater
+  - path: /etc/environment.sh
+    permissions: 755
+    content: |
+      #!/bin/bash
+      set -e
+      set -u
+
+      OLDIP=$(grep "ELASTICSEARCH_IP" /etc/environment | sed -E 's/[^\.0-9]//g')
+      NEWIP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' elasticsearch)
+      sed -i 's|'${OLDIP}'|'${NEWIP}'|g' /etc/environment
+      sed -i 's|'${OLDIP}'|'${NEWIP}'|g' /etc/nginx/hosts.d/default.conf
+      sed -i 's|'${OLDIP}'|'${NEWIP}'|g' /etc/logstash/logstash.conf
+
+# Elasticsearch Custom Config
+  - path: /etc/elasticsearch/elasticsearch.yml
+    content: |
+      cluster.name: Elasticsearch-cluster
+      node.name: "Master Node 1"
+      # Kibana Fix
+      http.cors.allow-origin: "/.*/"
+      http.cors.enabled: true
+      # Filesystem niofs
+      index.store.type: niofs
+
+# Nginx for Elasticsearch access
+  - path: /etc/nginx/hosts.d/default.conf
+    content: |
+      server {
+           listen 80;
+           location / {
+               proxy_pass http://127.0.0.1:9200;
+               proxy_http_version 1.1;
+               proxy_set_header Connection "Keep-Alive";
+               proxy_set_header Proxy-Connection "Keep-Alive";
+               auth_basic  "closed site";
+               auth_basic_user_file /etc/nginx/hosts.d/passwd;
+               rewrite ^(/marvel)(.*)$ /_plugin/marvel permanent;
+               rewrite ^(/kibana)(.*)$ /_plugin/kibana3 permanent;
+           }
+       }
+
+# Nginx Passwords for access
+  - path: /etc/nginx/hosts.d/passwd
+    content: |
+      user:YmwhP33gTK41E

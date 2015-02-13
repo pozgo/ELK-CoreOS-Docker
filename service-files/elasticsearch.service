@@ -1,0 +1,24 @@
+[Unit]
+Description=Elasticsearch Server
+After=docker.service
+Requires=docker.service
+
+[Service]
+TimeoutStartSec=0
+Type=oneshot
+RemainAfterExit=true
+ExecStartPre=-/usr/bin/docker kill elasticsearch
+ExecStartPre=-/usr/bin/docker rm -f elasticsearch
+ExecStartPre=/usr/bin/docker pull million12/elasticsearch
+ExecStart=/usr/bin/docker run \
+  -d \
+  --name elasticsearch \
+  -p 9200:9200 \
+# Share Data from Elasticsearch to host OS
+  -v /elasticsearch:/opt/elasticsearch/data \
+  million12/elasticsearch
+ExecStop=/usr/bin/docker stop elasticsearch
+Restart=allways
+
+[Install]
+WantedBy=multi-user.target
