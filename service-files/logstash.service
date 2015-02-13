@@ -1,0 +1,23 @@
+[Unit]
+Description=Logstash Server
+After=docker.service
+
+[Service]
+TimeoutStartSec=0
+Type=oneshot
+RemainAfterExit=true
+EnvironmentFile=/etc/environment
+ExecStartPre=-/usr/bin/docker kill logstash
+ExecStartPre=-/usr/bin/docker rm -f logstash
+ExecStartPre=/usr/bin/docker pull million12/logstash:latest
+ExecStart=/usr/bin/docker run \
+  -d \
+  --name logstash \
+  -p 5000:5000 \
+  -v /path/to/logstash.conf:/etc/logstash/logstash.conf \
+  million12/logstash
+ExecStop=/usr/bin/docker stop logstash
+Restart=allways
+
+[Install]
+WantedBy=multi-user.target
